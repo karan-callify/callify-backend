@@ -1,3 +1,92 @@
+# Fetch data from the database using SQL Query Language (SQLAlchemy)
+
+
+async def generate_best_times():
+    async with async_session_maker() as session:
+        # Get latest call_start_time
+        latest_date_result = await session.execute(
+            select(func.max(JobInvite.call_start_time))
+        )
+        latest_date = latest_date_result.scalar_one_or_none()
+        if not latest_date:
+            print("No records in DB.")
+            return
+
+        final_results = {}
+        ranges = {
+            "90_days": latest_date - timedelta(days=90),
+            "7_days": latest_date - timedelta(days=7),
+        }
+
+        for label, start_date in ranges.items():
+            # ---- Hourly aggregation ----
+            stmt_hours = text("""
+                SELECT
+                    countryCode,
+                    DAYNAME(call_start_time) AS weekday,
+                    HOUR(call_start_time) AS hour,
+                    COUNT(*) * 1.0 / COUNT(DISTINCT DATE(call_start_time)) AS avg_calls
+                FROM jobinvite
+                WHERE call_start_time >= :start_date
+                GROUP BY countryCode, weekday, hour
+            """)
+
+            rows_hours = (await session.execute(stmt_hours, {"start_date": start_date})).mappings().all()
+
+            # Organize by country -> weekday -> [(hour, avg_calls)]
+            country_hours = defaultdict(lambda: defaultdict(list))
+            for r in rows_hours:
+                country_hours[r["countryCode"]][r["weekday"]].append((r["hour"], r["avg_calls"]))
+
+            # ---- Averages ----
+            stmt_avg = text("""
+                SELECT
+                    countryCode,
+                    AVG(total_call) AS avg_call_time,
+                    AVG(
+                        CASE 
+                            WHEN DTMF IS NOT NULL AND DTMF != '' 
+                            THEN LENGTH(REPLACE(DTMF, ',', '')) 
+                            ELSE 0
+                        END
+                    ) AS avg_questions
+                FROM jobinvite
+                WHERE call_start_time >= :start_date
+                GROUP BY countryCode
+            """)
+
+            rows_avg = (await session.execute(stmt_avg, {"start_date": start_date})).mappings().all()
+            avg_map = {r["countryCode"]: r for r in rows_avg}
+
+            # ---- Build result per country ----
+            for country in set(list(country_hours.keys()) + list(avg_map.keys())):
+                if country not in final_results:
+                    final_results[country] = {}
+
+                # format best hours
+                best_hours = {}
+                weekdays_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                for day in weekdays_order:
+                    hours = sorted(country_hours[country].get(day, []), key=lambda x: x[1], reverse=True)[:3]
+                    best_hours[day.lower()[:3]] = [f"{h:02d}:00" for h, _ in hours]
+
+                avg_row = avg_map.get(country, {})
+                final_results[country][label] = {
+                    "best_hours": best_hours,
+                    "avg_number_of_question_user_answers": round(avg_row.get("avg_questions", 0) or 0, 2),
+                    "average_call_time": round(avg_row.get("avg_call_time", 0) or 0, 2),
+                }
+
+        # ---- Save to JSON ----
+        file_path = os.path.join(os.path.dirname(__file__), "best_times.json")
+        with open(file_path, "w") as f:
+            json.dump(final_results, f, default=str, indent=4)
+
+        print(f"Results saved to {file_path}")
+
+
+
+# cron job that uses average call times and best hours
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
 from collections import defaultdict
@@ -108,7 +197,7 @@ async def analyze_calls(results):
     }
 
 
-async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
+async def generate_best_times(days_large: int = 3000, days_small: int = 1500):
     async with async_session_maker() as session:
         # Find latest call time
         latest_date_result = await session.execute(select(func.max(JobInvite.call_start_time)))
@@ -144,26 +233,15 @@ async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
             empty_days = [day for day, times in best_hours_7.items() if not times]
 
             if len(empty_days) == 1:
-                # Fill with weekly average from non-empty days
-                all_hours = []
-                for day, times in best_hours_7.items():
-                    if times:
-                        all_hours.extend(times)
-                if all_hours:
-                    # Most common top 3 across the week
-                    avg_top = [h for h, _ in sorted(
-                        ((hr, all_hours.count(hr)) for hr in set(all_hours)),
-                        key=lambda x: x[1],
-                        reverse=True
-                    )[:3]]
-                    best_hours_7[empty_days[0]] = avg_top
+                # Fill with overall top hours from 7 days
+                best_hours_7[empty_days[0]] = res_small["top_overall_hours"]
             elif len(empty_days) > 1:
-                # Fill all with overall top from 90 days
+                # Copy from 30 days
                 for day in empty_days:
-                    best_hours_7[day] = res_large["top_overall_hours"]
+                    best_hours_7[day] = res_large["best_hours"].get(day, [])
 
             final_results[country] = {
-                "90_days": res_large,
+                "30_days": res_large,
                 "7_days": {**res_small, "best_hours": best_hours_7},
             }
 
