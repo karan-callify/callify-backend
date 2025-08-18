@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
-from collections import defaultdict
+from collections import defaultdict, Counter
 import statistics
 import json
 import os
@@ -9,17 +9,102 @@ from app.api.routes.v1.analysis.models import JobInvite
 from app.db.session import async_session_maker
 
 
-async def analyze_calls(results):
-    # Prepare data
+# ---------------- Utility Functions ---------------- #
+
+def prepare_call_data(results):
+    """Filter and prepare raw call data."""
     data = []
     for i in results:
-        if not i.call_start_time or not i.total_call:
-            continue
-        data.append({
-            "call_start_time": i.call_start_time,
-            "total_call": i.total_call,
-            "DTMF": i.DTMF,
-        })
+        if i.call_start_time and i.total_call:
+            data.append({
+                "call_start_time": i.call_start_time,
+                "total_call": i.total_call,
+                "DTMF": i.DTMF,
+            })
+    return data
+
+
+def filter_calls(data):
+    """Filter out calls shorter than the dynamic min_duration (average call length)."""
+    if not data:
+        return []
+
+    # min_duration = statistics.mean([d["total_call"] for d in data])
+    min_duration = 10  # Fallback to a default value if no data is available
+    if min_duration <= 0:   # Avoid division by zero
+        min_duration = 10
+    return [d for d in data if d["total_call"] > min_duration]
+
+
+def add_time_features(data):
+    """Add weekday, hour, and date fields to call records."""
+    for d in data:
+        d["weekday"] = d["call_start_time"].strftime("%A")
+        d["hour"] = d["call_start_time"].hour
+        d["date"] = d["call_start_time"].date()
+    return data
+
+
+def compute_avg_calls_per_hour(data):
+    """Compute average calls per hour per weekday."""
+    unique_days = set((d["date"], d["weekday"]) for d in data)
+    num_days_per_weekday = {
+        day: sum(1 for _, w in unique_days if w == day)
+        for day in set(w for _, w in unique_days)
+    }
+
+    grouped = defaultdict(lambda: defaultdict(int))
+    for d in data:
+        grouped[d["weekday"]][d["hour"]] += 1
+
+    avg_calls = defaultdict(dict)
+    for weekday, hours in grouped.items():
+        for hour, total_calls in hours.items():
+            days = num_days_per_weekday.get(weekday, 1)
+            avg_calls[weekday][hour] = total_calls / days
+    return avg_calls, grouped
+
+
+def get_top_overall_hours(grouped, top_n=3):
+    """Get overall top hours ignoring weekdays."""
+    overall_counts = Counter()
+    for _, hours in grouped.items():
+        for hour, total_calls in hours.items():
+            overall_counts[hour] += total_calls
+    return [f"{h:02d}:00" for h, _ in overall_counts.most_common(top_n)]
+
+
+def get_best_hours_by_weekday(avg_calls, top_n=3):
+    """Get top N hours for each weekday."""
+    weekdays_order = [
+        "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday", "Sunday"
+    ]
+    result = {}
+    for day in weekdays_order:
+        hours = avg_calls.get(day, {})
+        top_hours = sorted(hours.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        result[day.lower()[:3]] = [f"{h:02d}:00" for h, _ in top_hours]
+    return result
+
+
+def compute_call_statistics(data):
+    """Compute average DTMF count and call time."""
+    dtmf_counts = []
+    for d in data:
+        if d["DTMF"]:
+            dtmf_counts.append(len([x for x in d["DTMF"].split(",") if x.strip()]))
+    avg_questions = statistics.mean(dtmf_counts) if dtmf_counts else 0
+    avg_call_time = statistics.mean([d["total_call"] for d in data]) if data else 0
+    return round(avg_questions, 2), round(avg_call_time, 2)
+
+
+# ---------------- Core Analysis ---------------- #
+
+async def analyze_calls(results):
+    """Perform analysis on call records."""
+    data = prepare_call_data(results)
+    data = filter_calls(data)
 
     if not data:
         return {
@@ -29,88 +114,44 @@ async def analyze_calls(results):
             "average_call_time": 0,
         }
 
-    # Calculate min_duration (average total_call)
-    min_duration = statistics.mean([d["total_call"] for d in data])
+    data = add_time_features(data)
+    avg_calls, grouped = compute_avg_calls_per_hour(data)
 
-    # Filter calls where total_call > min_duration
-    filtered = [d for d in data if d["total_call"] > min_duration]
-
-    if not filtered:
-        return {
-            "best_hours": {},
-            "top_overall_hours": [],
-            "avg_number_of_question_user_answers": 0,
-            "average_call_time": 0,
-        }
-
-    # Add weekday, hour, date
-    for d in filtered:
-        d["weekday"] = d["call_start_time"].strftime("%A")
-        d["hour"] = d["call_start_time"].hour
-        d["date"] = d["call_start_time"].date()
-
-    # Unique days per weekday
-    unique_days = set((d["date"], d["weekday"]) for d in filtered)
-    num_days_per_weekday = {
-        day: sum(1 for _, w in unique_days if w == day)
-        for day in set(w for _, w in unique_days)
-    }
-
-    # Group by weekday, hour
-    grouped = defaultdict(lambda: defaultdict(int))
-    for d in filtered:
-        grouped[d["weekday"]][d["hour"]] += 1
-
-    # Calculate average calls per hour per weekday
-    avg_calls = defaultdict(dict)
-    for weekday, hours in grouped.items():
-        for hour, total_calls in hours.items():
-            days = num_days_per_weekday.get(weekday, 1)
-            avg_calls[weekday][hour] = total_calls / days
-
-    # ---- Overall top hours (whole dataset, ignore weekday) ----
-    overall_counts = defaultdict(int)
-    for weekday, hours in grouped.items():
-        for hour, total_calls in hours.items():
-            overall_counts[hour] += total_calls
-
-    top_overall_hours = sorted(
-        overall_counts.items(), key=lambda x: x[1], reverse=True
-    )[:3]
-    top_overall_hours = [f"{h:02d}:00" for h, _ in top_overall_hours]
-
-    # For each weekday, get top 3 hours
-    weekdays_order = [
-        "Monday", "Tuesday", "Wednesday", "Thursday",
-        "Friday", "Saturday", "Sunday"
-    ]
-    result = {}
-    for day in weekdays_order:
-        hours = avg_calls.get(day, {})
-        top_hours = sorted(hours.items(), key=lambda x: x[1], reverse=True)[:3]
-        result[day.lower()[:3]] = [f"{h:02d}:00" for h, _ in top_hours]
-
-    # Calculate avg_number_of_question_user_answers
-    dtmf_counts = []
-    for d in filtered:
-        if d["DTMF"]:
-            dtmf_counts.append(len([x for x in d["DTMF"].split(",") if x.strip()]))
-    avg_questions = statistics.mean(dtmf_counts) if dtmf_counts else 0
-
-    # Calculate average_call_time
-    avg_call_time = statistics.mean([d["total_call"] for d in filtered])
+    best_hours = get_best_hours_by_weekday(avg_calls)
+    top_overall_hours = get_top_overall_hours(grouped)
+    avg_questions, avg_call_time = compute_call_statistics(data)
 
     return {
-        "best_hours": result,
+        "best_hours": best_hours,
         "top_overall_hours": top_overall_hours,
-        "avg_number_of_question_user_answers": round(avg_questions, 2),
-        "average_call_time": round(avg_call_time, 2),
+        "avg_number_of_question_user_answers": avg_questions,
+        "average_call_time": avg_call_time,
     }
 
 
-async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
+def fill_missing_days(res_small, res_large):
+    """Fill missing best_hours using weekly average or fallback to large window."""
+    best_hours_7 = res_small["best_hours"]
+    empty_days = [day for day, times in best_hours_7.items() if not times]
+
+    if len(empty_days) == 1:
+        # Fill with weekly average from non-empty days
+        all_hours = [h for times in best_hours_7.values() if times for h in times]
+        if all_hours:
+            avg_top = [h for h, _ in Counter(all_hours).most_common(3)]
+            best_hours_7[empty_days[0]] = avg_top
+    elif len(empty_days) > 1:
+        # Fill all with overall top from 90 days
+        for day in empty_days:
+            best_hours_7[day] = res_large["top_overall_hours"]
+
+    return best_hours_7
+
+
+# ---------------- Orchestration ---------------- #
+
+async def generate_best_times(days_large: int = 90, days_small: int = 7):
     async with async_session_maker() as session:
-        # Find latest call time
         latest_date_result = await session.execute(select(func.max(JobInvite.call_start_time)))
         latest_date = latest_date_result.scalar_one_or_none()
         if not latest_date:
@@ -119,7 +160,6 @@ async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
 
         final_results = {}
 
-        # ---- Fetch only once (large window, e.g., 90 days) ----
         start_date = latest_date - timedelta(days=days_large)
         stmt = select(JobInvite).where(JobInvite.call_start_time >= start_date)  # type: ignore
 
@@ -127,9 +167,8 @@ async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
         async for row in (await session.stream(stmt.execution_options(yield_per=1000))).scalars():
             country_map[row.countryCode].append(row)
 
-        print("data fetched for all countries.")
+        print("Data fetched for all countries.")
 
-        # ---- Analyze for all windows ----
         for country, rows in country_map.items():
             cutoff_small = latest_date - timedelta(days=days_small)
 
@@ -139,35 +178,15 @@ async def generate_best_times(days_large: int = 3000, days_small: int = 2500):
             res_large = await analyze_calls(data_large)
             res_small = await analyze_calls(data_small)
 
-            # ---- Apply fallback ----
-            best_hours_7 = res_small["best_hours"]
-            empty_days = [day for day, times in best_hours_7.items() if not times]
-
-            if len(empty_days) == 1:
-                # Fill with weekly average from non-empty days
-                all_hours = []
-                for day, times in best_hours_7.items():
-                    if times:
-                        all_hours.extend(times)
-                if all_hours:
-                    # Most common top 3 across the week
-                    avg_top = [h for h, _ in sorted(
-                        ((hr, all_hours.count(hr)) for hr in set(all_hours)),
-                        key=lambda x: x[1],
-                        reverse=True
-                    )[:3]]
-                    best_hours_7[empty_days[0]] = avg_top
-            elif len(empty_days) > 1:
-                # Fill all with overall top from 90 days
-                for day in empty_days:
-                    best_hours_7[day] = res_large["top_overall_hours"]
+            # Fallback filling
+            res_small["best_hours"] = fill_missing_days(res_small, res_large)
 
             final_results[country] = {
                 "90_days": res_large,
-                "7_days": {**res_small, "best_hours": best_hours_7},
+                "7_days": res_small,
             }
 
-        # ---- Save results ----
+        # Save results
         file_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "analysis_results",
