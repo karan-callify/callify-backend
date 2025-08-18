@@ -1,0 +1,47 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class AppSettings(BaseSettings):
+    APP_NAME: str = "Callify"
+    APP_DOMAIN: str = "localhost:8000"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore"
+    )
+
+
+class DatabaseSettings(BaseSettings):
+    MYSQL_SERVER: str
+    MYSQL_PORT: int
+    MYSQL_USER: str
+    MYSQL_PASSWORD: str
+    MYSQL_DB: str
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore"
+    )
+
+    @property
+    def MYSQL_URL(self) -> str:
+        # Async connection string for SQLAlchemy
+        return (
+            f"mysql+aiomysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}"
+            f"@{self.MYSQL_SERVER}:{self.MYSQL_PORT}/{self.MYSQL_DB}"
+        )
+
+    @property
+    def MYSQL_URL_SYNC(self) -> str:
+        # Sync connection string (for Alembic migrations)
+        return (
+            f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}"
+            f"@{self.MYSQL_SERVER}:{self.MYSQL_PORT}/{self.MYSQL_DB}"
+        )
+
+
+# These will now be filled by env vars or Docker Compose .env
+app_settings = AppSettings()
+db_settings = DatabaseSettings()  # type: ignore
