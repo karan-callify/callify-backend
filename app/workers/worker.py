@@ -13,7 +13,13 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     scheduler.add_job(
         generate_best_times,
-        CronTrigger(second=5)  # adjust to desired schedule
+        CronTrigger(
+            day_of_week="sat",
+            hour=0,             # 12 AM
+            minute=0,           # 00 minutes
+            second=0,
+            timezone="Asia/Kolkata"            # 00 seconds
+        )
     )
     scheduler.start()
     print("Scheduler started ✅")

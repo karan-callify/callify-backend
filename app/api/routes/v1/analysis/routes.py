@@ -8,6 +8,7 @@ from fastapi import (
     UploadFile,
     Response
 )
+from fastapi.responses import JSONResponse
 from pydantic import EmailStr
 
 from app.api.dependencies import AnalysisServiceDep
@@ -17,11 +18,6 @@ from app.api.routes.v1.analysis.schemas import (
 
 router = APIRouter()
 
-
-@router.get("/", response_model=AnalysisRead)
-async def get_full_profile(service: AnalysisServiceDep):
-    result = 1
-    return result
 
 @router.get("/analysis_of_calls", response_model=AnalysisRead)
 async def get_analysis_of_calls(
@@ -39,3 +35,16 @@ async def get_analysis_of_calls(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+    
+@router.get("/health")
+async def health_check():
+    """
+    Simple health check endpoint.
+    """
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "message": "API is live"
+        }
+    )
