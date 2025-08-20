@@ -14,11 +14,11 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(
         generate_best_times,
         CronTrigger(
-            day_of_week=cron_settings.CRON_DAY_OF_WEEK,
-            hour=cron_settings.CRON_HOUR,
-            minute=cron_settings.CRON_MINUTE,
+            # day_of_week=cron_settings.CRON_DAY_OF_WEEK,
+            # hour=cron_settings.CRON_HOUR,
+            # minute=cron_settings.CRON_MINUTE,
             second=cron_settings.CRON_SECOND,
-            timezone=cron_settings.CRON_TIMEZONE,
+            # timezone=cron_settings.CRON_TIMEZONE,
         )
     )
     scheduler.start()
