@@ -7,7 +7,10 @@ import os
 
 from app.api.routes.v1.analysis.models import JobInvite
 from app.db.session import async_session_maker
+from app.config import CronSettings
 
+
+cron_days_settings = CronSettings()
 
 # ---------------- Utility Functions ---------------- #
 
@@ -150,7 +153,7 @@ def fill_missing_days(res_small, res_large):
 
 # ---------------- Orchestration ---------------- #
 
-async def generate_best_times(days_large: int = 2000, days_small: int = 1800):
+async def generate_best_times(days_large: int = cron_days_settings.THREE_MONTHS, days_small: int = cron_days_settings.SEVEN_DAYS):
     async with async_session_maker() as session:
         latest_date_result = await session.execute(select(func.max(JobInvite.call_start_time)))
         latest_date = latest_date_result.scalar_one_or_none()

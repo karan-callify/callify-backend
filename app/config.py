@@ -42,6 +42,22 @@ class DatabaseSettings(BaseSettings):
         )
 
 
+class CronSettings(BaseSettings):
+    THREE_MONTHS: int = 90
+    SEVEN_DAYS: int = 7
+
+    CRON_DAY_OF_WEEK: str = "sat"
+    CRON_HOUR: int = 0
+    CRON_MINUTE: int = 0
+    CRON_SECOND: int = 0
+    CRON_TIMEZONE: str = "Asia/Kolkata"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore"
+    )
+
 # These will now be filled by env vars or Docker Compose .env
 app_settings = AppSettings()
 db_settings = DatabaseSettings()  # type: ignore

@@ -4,6 +4,9 @@ from sqlmodel import SQLModel, Field, Column
 from sqlalchemy import String, Text, BigInteger, Integer, SmallInteger, Float, DECIMAL, DateTime, text, Index, UniqueConstraint
 from sqlalchemy.dialects.mysql import TINYINT, MEDIUMINT, VARCHAR
 
+# All the models are created to match the database schema from the database, and if you are connectling to an existing database, these models should match the structure of your tables in the database, otherwise alembic migration will drop/change the database structure and will cause errors in the other projects using the db.
+
+
 class JobResponse(SQLModel, table=True):
     __tablename__ = "jobresponse"
 
