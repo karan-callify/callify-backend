@@ -15,6 +15,9 @@ from app.api.dependencies import AnalysisServiceDep
 from app.api.routes.v1.analysis.schemas import (
     AnalysisRead
 )
+from app.core.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 router = APIRouter()
 
@@ -25,16 +28,32 @@ async def get_analysis_of_calls(
     country_code: Optional[str] = None,
 ):
     """
-    Get analysis of calls with optional filters for country and date range.
+    Get analysis of calls with optional filters for country.
     """
     try:
         result = await service.get_analysis_of_calls(country_code)
+
+        # Case 1: No results (service returned None or empty dict)
+        if not result or not result.data:
+            logger.warning(f"No analysis data found. country_code={country_code}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No analysis data found for the given filters."
+            )
+
         return result
-    except Exception as e:
+
+    except ValueError as ve:
+        # Case 2: Bad input (e.g., invalid country code)
+        logger.warning(f"Invalid input in analysis_of_calls: {ve}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e)
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve)
         )
+
+    except HTTPException:
+        # Already a FastAPI HTTPException → just bubble up
+        raise
     
 @router.get("/health")
 async def health_check():
