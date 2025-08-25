@@ -4,6 +4,7 @@ from collections import defaultdict
 import statistics
 import json
 import os
+import uuid
 
 from app.api.routes.v1.analysis.models import JobInvite
 from app.db.session import async_session_maker
@@ -11,13 +12,11 @@ from app.config import CronSettings
 
 cron_days_settings = CronSettings()
 
-
 # ---------------- Utility Functions ---------------- #
 
 def get_time_ranges():
     """Generate hourly ranges like 10:01-11:00."""
     return [(h, f"{h:02d}:01-{(h+1) % 24:02d}:00") for h in range(24)]
-
 
 def classify_call(total_call):
     """Classify call based on duration."""
@@ -26,7 +25,6 @@ def classify_call(total_call):
     elif total_call < 120:
         return "not_interested"
     return "interested"
-
 
 def bucketize_calls(rows):
     """Group calls into weekday + time range buckets with percentages."""
@@ -60,13 +58,11 @@ def bucketize_calls(rows):
                 data[weekday][range_label] = {k: 0.0 for k in counts}
     return data
 
-
 def count_questions_from_dtmf(dtmf: str) -> int:
     """Old method: count number of comma-separated non-empty entries."""
     if not dtmf:
         return 0
     return sum(1 for p in str(dtmf).split(",") if p.strip() != "")
-
 
 def calculate_averages(rows):
     """Calculate average call duration and questions answered."""
@@ -77,7 +73,6 @@ def calculate_averages(rows):
         "avg_call_duration": round(statistics.mean(durations), 2) if durations else 0.0,
         "avg_number_of_questions_answered": round(statistics.mean(dtmf_counts), 2) if dtmf_counts else 0.0,
     }
-
 
 def average_missing_day(all_weekdays):
     """Average across available weekdays to synthesize missing one."""
@@ -103,44 +98,59 @@ def average_missing_day(all_weekdays):
         result[range_label] = avg_counts
     return result
 
-
 def fix_missing_days(buckets, old_buckets, window="three_months", fallback_from=None):
     """
     Apply rules:
       - Missing weekdays → average / old data
-      - Weekdays with <4 slots → pull from fallback (7d→3m, 3m→old)
+      - Weekdays with <4 slots → pull from fallback (7d→3m, 3m→old, fallback to average if no old data)
     """
     weekmap = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     existing_days = set(buckets.keys())
     missing_days = [d for d in weekmap if d not in existing_days]
 
+    print(f"Window: {window}")
+    print(f"Existing days: {existing_days}")
+    print(f"Missing days: {missing_days}")
+    print(f"Old buckets keys: {list(old_buckets.keys())} if old_buckets exists: {bool(old_buckets)}")
+
     # Missing weekdays
     if len(missing_days) == 1:
         buckets[missing_days[0]] = average_missing_day(buckets)
+        print(f"Added missing day {missing_days[0]} using average")
     elif len(missing_days) >= 2:
         for md in missing_days:
             if old_buckets and md in old_buckets:
                 buckets[md] = old_buckets[md]
+                print(f"Added missing day {md} from old_buckets")
             else:
                 buckets[md] = average_missing_day(buckets)
+                print(f"Added missing day {md} using average")
 
     # Weak weekdays (<4 slots)
     for wd in weekmap:
         if wd not in buckets:
             continue
+        print(f"Checking {wd} with {len(buckets[wd])} slots")
         if len(buckets[wd]) < 4:
             if window == "seven_days" and fallback_from and wd in fallback_from:
                 buckets[wd] = fallback_from[wd]
+                print(f"Replaced {wd} from fallback_from (three_months)")
             elif window == "three_months" and old_buckets and wd in old_buckets:
                 buckets[wd] = old_buckets[wd]
+                print(f"Replaced {wd} from old_buckets")
+            else:
+                buckets[wd] = average_missing_day(buckets)
+                print(f"Replaced {wd} using average_missing_day due to missing old_buckets data")
 
     return buckets
-
 
 # ---------------- Core Analysis ---------------- #
 
 async def generate_best_times_new():
     """Perform new analysis with fallbacks and missing/weak-day handling."""
+    run_id = str(uuid.uuid4())
+    print(f"Starting generate_best_times_new with run_id: {run_id}")
+
     # Load old results
     file_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -152,8 +162,15 @@ async def generate_best_times_new():
         try:
             with open(file_path, "r") as f:
                 old_data = json.load(f)
-        except json.JSONDecodeError:
+            print(f"Successfully loaded old_data from {file_path}: {json.dumps(old_data, indent=2)}")
+        except json.JSONDecodeError as e:
+            print(f"Failed to load JSON from {file_path}: {e}")
             old_data = {}
+        except Exception as e:
+            print(f"Error accessing {file_path}: {e}")
+            old_data = {}
+    else:
+        print(f"File {file_path} does not exist")
 
     async with async_session_maker() as session:
         latest_date_result = await session.execute(select(func.max(JobInvite.call_start_time)))
@@ -169,7 +186,9 @@ async def generate_best_times_new():
         country_map = defaultdict(list)
         try:
             async for row in (await session.stream(stmt.execution_options(yield_per=1000))).scalars():
-                country_map[row.countryCode].append(row)
+                # Normalize country code to string
+                country_code = str(row.countryCode)
+                country_map[country_code].append(row)
         except Exception as e:
             print(f"Error fetching data: {e}")
             return
@@ -178,7 +197,7 @@ async def generate_best_times_new():
             print("No new data fetched. Exiting.")
             return
 
-        print("Data fetched for all countries.")
+        print(f"Data fetched for countries: {list(country_map.keys())}")
 
         final_results = {}
 
@@ -190,12 +209,14 @@ async def generate_best_times_new():
             }
 
             for key, cutoff in windows.items():
+                print(f"Processing window: {key} for country: {country}")
                 window_rows = [r for r in rows if r.call_start_time >= cutoff]
                 buckets = bucketize_calls(window_rows)
                 avgs = calculate_averages(window_rows)
 
-                # old buckets for fallback
-                old_buckets = old_data.get(country, {}).get(key, {})
+                # old buckets for fallback, normalize country code
+                old_buckets = old_data.get(str(country), {}).get(key, {})
+                print(f"Old buckets for {country}/{key}: {json.dumps(old_buckets, indent=2)}")
                 fallback_from = final_results[country].get("three_months", {}) if key == "seven_days" else None
 
                 # Apply fix rules
@@ -213,4 +234,4 @@ async def generate_best_times_new():
         with open(file_path, "w") as f:
             json.dump(final_results, f, default=str, indent=4)
 
-        print(f"Results saved to {file_path}")
+        print(f"Results saved to {file_path} for run_id: {run_id}")
