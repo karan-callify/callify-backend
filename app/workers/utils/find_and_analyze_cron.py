@@ -1,14 +1,13 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 from sqlalchemy import select, func
 from collections import defaultdict
+import statistics
 import json
 import os
-import statistics
 
 from app.api.routes.v1.analysis.models import JobInvite
 from app.db.session import async_session_maker
 from app.config import CronSettings
-
 
 cron_days_settings = CronSettings()
 
@@ -17,12 +16,7 @@ cron_days_settings = CronSettings()
 
 def get_time_ranges():
     """Generate hourly ranges like 10:01-11:00."""
-    ranges = []
-    for h in range(0, 24):
-        start = f"{h:02d}:01"
-        end = f"{(h+1)%24:02d}:00"
-        ranges.append((h, f"{start}-{end}"))
-    return ranges
+    return [(h, f"{h:02d}:01-{(h+1) % 24:02d}:00") for h in range(24)]
 
 
 def classify_call(total_call):
@@ -31,8 +25,7 @@ def classify_call(total_call):
         return "not_answered"
     elif total_call < 120:
         return "not_interested"
-    else:
-        return "interested"
+    return "interested"
 
 
 def bucketize_calls(rows):
@@ -40,7 +33,6 @@ def bucketize_calls(rows):
     ranges = get_time_ranges()
     weekmap = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
-    # structure: weekday -> range_label -> counts
     data = defaultdict(lambda: defaultdict(lambda: {
         "not_answered": 0,
         "not_interested": 0,
@@ -50,125 +42,173 @@ def bucketize_calls(rows):
     for r in rows:
         if not r.call_start_time:
             continue
-
         weekday = weekmap[r.call_start_time.weekday()]
         hour = r.call_start_time.hour
-
-        # map hour to range
         _, range_label = ranges[hour]
-
         cls = classify_call(r.total_call)
         data[weekday][range_label][cls] += 1
 
-    # ✅ convert to percentages
+    # convert counts → %
     for weekday, ranges_dict in data.items():
         for range_label, counts in ranges_dict.items():
             total = sum(counts.values())
             if total > 0:
                 data[weekday][range_label] = {
-                    k: round((v / total) * 100, 2)  # 2 decimal %
-                    for k, v in counts.items()
+                    k: round((v / total) * 100, 2) for k, v in counts.items()
                 }
             else:
-                data[weekday][range_label] = {
-                    "not_answered": 0.0,
-                    "not_interested": 0.0,
-                    "interested": 0.0
-                }
-
+                data[weekday][range_label] = {k: 0.0 for k in counts}
     return data
 
 
 def count_questions_from_dtmf(dtmf: str) -> int:
-    """
-    Old method: count number of comma-separated non-empty entries in DTMF.
-    Examples:
-      "1,1" -> 2
-      "1,  ,2" -> 2
-      "" or None -> 0
-    """
+    """Old method: count number of comma-separated non-empty entries."""
     if not dtmf:
         return 0
-    parts = [p.strip() for p in str(dtmf).split(",")]
-    return sum(1 for p in parts if p != "")
+    return sum(1 for p in str(dtmf).split(",") if p.strip() != "")
 
 
 def calculate_averages(rows):
-    """
-    Calculate averages directly from raw rows:
-      - avg_call_duration: mean of total_call > 0
-      - avg_number_of_questions_answered: mean of counts from DTMF split method
-    """
+    """Calculate average call duration and questions answered."""
     durations = [r.total_call for r in rows if getattr(r, "total_call", None) and r.total_call > 0]
-
-    dtmf_counts = []
-    for r in rows:
-        dtmf_val = getattr(r, "DTMF", None)
-        if dtmf_val:  # only include rows that actually have a DTMF string
-            dtmf_counts.append(count_questions_from_dtmf(dtmf_val))
-
-    avg_call_duration = round(statistics.mean(durations), 2) if durations else 0.0
-    avg_questions_answered = round(statistics.mean(dtmf_counts), 2) if dtmf_counts else 0.0
+    dtmf_counts = [count_questions_from_dtmf(getattr(r, "DTMF", "")) for r in rows if getattr(r, "DTMF", None)]
 
     return {
-        "avg_call_duration": avg_call_duration,
-        "avg_number_of_questions_answered": avg_questions_answered,
+        "avg_call_duration": round(statistics.mean(durations), 2) if durations else 0.0,
+        "avg_number_of_questions_answered": round(statistics.mean(dtmf_counts), 2) if dtmf_counts else 0.0,
     }
+
+
+def average_missing_day(all_weekdays):
+    """Average across available weekdays to synthesize missing one."""
+    ranges = get_time_ranges()
+    result = {}
+    for _, range_label in ranges:
+        values = [all_weekdays[w][range_label] for w in all_weekdays if range_label in all_weekdays[w]]
+        if not values:
+            result[range_label] = {"not_answered": 0.0, "not_interested": 0.0, "interested": 0.0}
+            continue
+
+        avg_counts = {
+            "not_answered": statistics.mean(v["not_answered"] for v in values),
+            "not_interested": statistics.mean(v["not_interested"] for v in values),
+            "interested": statistics.mean(v["interested"] for v in values),
+        }
+
+        # normalize
+        total = sum(avg_counts.values())
+        if total > 0:
+            avg_counts = {k: round((v / total) * 100, 2) for k, v in avg_counts.items()}
+
+        result[range_label] = avg_counts
+    return result
+
+
+def fix_missing_days(buckets, old_buckets, window="three_months", fallback_from=None):
+    """
+    Apply rules:
+      - Missing weekdays → average / old data
+      - Weekdays with <4 slots → pull from fallback (7d→3m, 3m→old)
+    """
+    weekmap = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    existing_days = set(buckets.keys())
+    missing_days = [d for d in weekmap if d not in existing_days]
+
+    # Missing weekdays
+    if len(missing_days) == 1:
+        buckets[missing_days[0]] = average_missing_day(buckets)
+    elif len(missing_days) >= 2:
+        for md in missing_days:
+            if old_buckets and md in old_buckets:
+                buckets[md] = old_buckets[md]
+            else:
+                buckets[md] = average_missing_day(buckets)
+
+    # Weak weekdays (<4 slots)
+    for wd in weekmap:
+        if wd not in buckets:
+            continue
+        if len(buckets[wd]) < 4:
+            if window == "seven_days" and fallback_from and wd in fallback_from:
+                buckets[wd] = fallback_from[wd]
+            elif window == "three_months" and old_buckets and wd in old_buckets:
+                buckets[wd] = old_buckets[wd]
+
+    return buckets
 
 
 # ---------------- Core Analysis ---------------- #
 
 async def generate_best_times_new():
-    """Perform new analysis for 3 months, 1 month, and 7 days."""
+    """Perform new analysis with fallbacks and missing/weak-day handling."""
+    # Load old results
+    file_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "analysis_results",
+        "best_times.json"
+    )
+    old_data = {}
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as f:
+                old_data = json.load(f)
+        except json.JSONDecodeError:
+            old_data = {}
+
     async with async_session_maker() as session:
         latest_date_result = await session.execute(select(func.max(JobInvite.call_start_time)))
         latest_date = latest_date_result.scalar_one_or_none()
         if not latest_date:
-            print("No records in DB.")
+            print("No records in DB. Exiting.")
             return
 
-        # Fetch all data for last 3 months in one query (kept same as your current code)
+        # Query cutoff = 3 months
         start_date = latest_date - timedelta(days=cron_days_settings.THREE_MONTHS)
         stmt = select(JobInvite).where(JobInvite.call_start_time >= start_date)
 
         country_map = defaultdict(list)
-        async for row in (await session.stream(stmt.execution_options(yield_per=1000))).scalars():
-            country_map[row.countryCode].append(row)
+        try:
+            async for row in (await session.stream(stmt.execution_options(yield_per=1000))).scalars():
+                country_map[row.countryCode].append(row)
+        except Exception as e:
+            print(f"Error fetching data: {e}")
+            return
+
+        if not country_map:
+            print("No new data fetched. Exiting.")
+            return
 
         print("Data fetched for all countries.")
 
         final_results = {}
 
         for country, rows in country_map.items():
+            final_results[country] = {}
             windows = {
                 "three_months": latest_date - timedelta(days=cron_days_settings.THREE_MONTHS),
-                # "one_month": latest_date - timedelta(days=2500),
                 "seven_days": latest_date - timedelta(days=cron_days_settings.SEVEN_DAYS),
             }
 
-            final_results[country] = {}
             for key, cutoff in windows.items():
                 window_rows = [r for r in rows if r.call_start_time >= cutoff]
-
-                # Buckets (percentages) — unchanged
                 buckets = bucketize_calls(window_rows)
-
-                # Averages from raw rows using the old DTMF split logic
                 avgs = calculate_averages(window_rows)
 
-                # Merge: keep weekday buckets at top level, and add averages
-                window_obj = dict(buckets)  # copy to mutate safely
-                window_obj["avg_call_duration"] = avgs["avg_call_duration"]
-                window_obj["avg_number_of_questions_answered"] = avgs["avg_number_of_questions_answered"]
+                # old buckets for fallback
+                old_buckets = old_data.get(country, {}).get(key, {})
+                fallback_from = final_results[country].get("three_months", {}) if key == "seven_days" else None
 
+                # Apply fix rules
+                buckets = fix_missing_days(buckets, old_buckets, window=key, fallback_from=fallback_from)
+
+                # Special case: if 7d completely empty
+                if key == "seven_days" and not buckets:
+                    buckets = old_buckets or final_results[country].get("three_months", {})
+
+                window_obj = dict(buckets)
+                window_obj.update(avgs)
                 final_results[country][key] = window_obj
 
-        # Save results
-        file_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "analysis_results",
-            "best_times.json"
-        )
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "w") as f:
             json.dump(final_results, f, default=str, indent=4)
