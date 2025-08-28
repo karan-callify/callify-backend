@@ -31,12 +31,9 @@ def bucketize_calls(rows):
     ranges = get_time_ranges()
     weekmap = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
-    data = defaultdict(lambda: defaultdict(lambda: {
-        "not_answered": 0,
-        "not_interested": 0,
-        "interested": 0
-    }))
+    data = defaultdict(lambda: defaultdict(dict))
 
+    # First pass: Count calls
     for r in rows:
         if not r.call_start_time:
             continue
@@ -44,18 +41,33 @@ def bucketize_calls(rows):
         hour = r.call_start_time.hour
         _, range_label = ranges[hour]
         cls = classify_call(r.total_call)
+        
+        # Initialize dict for this time slot if needed
+        if range_label not in data[weekday]:
+            data[weekday][range_label] = {"not_answered": 0, "not_interested": 0, "interested": 0}
+        
         data[weekday][range_label][cls] += 1
 
-    # convert counts → %
-    for weekday, ranges_dict in data.items():
-        for range_label, counts in ranges_dict.items():
+    # Second pass: Convert to percentages and clean up empty slots
+    for weekday in list(data.keys()):
+        for range_label in list(data[weekday].keys()):
+            counts = data[weekday][range_label]
             total = sum(counts.values())
+            
             if total > 0:
+                # Convert to percentages, keeping all values even if 0
                 data[weekday][range_label] = {
-                    k: round((v / total) * 100, 2) for k, v in counts.items()
+                    k: round((v / total) * 100, 2)
+                    for k, v in counts.items()
                 }
             else:
-                data[weekday][range_label] = {k: 0.0 for k in counts}
+                # Only remove time slot if all values are 0
+                del data[weekday][range_label]
+                
+        # Remove empty weekdays
+        if not data[weekday]:
+            del data[weekday]
+            
     return data
 
 def count_questions_from_dtmf(dtmf: str) -> int:
