@@ -49,7 +49,10 @@ async def export_table(table_name: str):
 
 
 async def main():
-    await export_table("jobinvite")
+    tables = ["jobinvite", "jobresponse", "employerjob"]
+    for table in tables:
+      await export_table(table)
+
     await engine.dispose()   # ✅ properly close async connections
 
 if __name__ == "__main__":
