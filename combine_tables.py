@@ -1,21 +1,8 @@
 import pandas as pd
 from sqlalchemy import create_engine
 
-# ---------------------------
-# Database connection details
-# ---------------------------
-username = "your_user"
-password = "your_password"
-host = "localhost"
-port = "3306"
-database = "your_db"
-
-# Create SQLAlchemy engine
 engine = create_engine("mysql+pymysql://root:2004@localhost:3306/callify")
 
-# ---------------------------
-# SQL Query: employerjob + jobinvite + location
-# ---------------------------
 query = """
 SELECT
     ej.empnumber,
@@ -90,7 +77,6 @@ SELECT
     ji.NIVRTYPE,
     ji.NCALLIFYREFINVID
 
-
 FROM employerjob ej
 LEFT JOIN jobinvite ji
     ON ej.empnumber = ji.empnumber
@@ -104,19 +90,19 @@ LEFT JOIN location ci
 LEFT JOIN location_zip_codes zc
     ON ej.pin_code = zc.zip_id
 
-ORDER BY ej.empnumber, ej.jobnumber, ji.nid;
+ORDER BY ej.empnumber, ej.jobnumber, ji.nid
 """
 
-# ---------------------------
-# Run query & load into DataFrame
-# ---------------------------
-with engine.connect() as conn:
-    df = pd.read_sql(query, conn)
-
-# ---------------------------
-# Save to CSV
-# ---------------------------
 output_file = "employerjob_jobinvite_combined.csv"
-df.to_csv(output_file, index=False, encoding="utf-8")
+chunksize = 50000   # adjust as needed
 
-print(f"✅ Data exported successfully to {output_file}")
+with engine.connect() as conn:
+    first = True
+    i = 0
+    for chunk in pd.read_sql(query, conn, chunksize=chunksize):
+        chunk.to_csv(output_file, mode="a", index=False, encoding="utf-8", header=first)
+        i += 1
+        print(f"✅ Wrote chunk {i} ({len(chunk)} rows)")
+        first = False
+
+print(f"\n✅ Export finished: {output_file}")
