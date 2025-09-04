@@ -75,7 +75,10 @@ SELECT
     ji.STRREFJDID,
     ji.STRDOCUMENTS,
     ji.NIVRTYPE,
-    ji.NCALLIFYREFINVID
+    ji.NCALLIFYREFINVID,
+
+    -- ✅ new field: all transcripts merged
+    COALESCE(rt.transcripts, '') AS transcripts
 
 FROM employerjob ej
 LEFT JOIN jobinvite ji
@@ -89,11 +92,21 @@ LEFT JOIN location ci
     ON ej.city = ci.location_id
 LEFT JOIN location_zip_codes zc
     ON ej.pin_code = zc.zip_id
+LEFT JOIN (
+    SELECT 
+        NEMPID, 
+        NJDID, 
+        GROUP_CONCAT(STRTRANS ORDER BY NID SEPARATOR '** ') AS transcripts
+    FROM recruiter_transcripts
+    GROUP BY NEMPID, NJDID
+) rt
+    ON ej.empnumber = rt.NEMPID
+   AND ej.jobnumber = rt.NJDID
 
 ORDER BY ej.empnumber, ej.jobnumber, ji.nid
 """
 
-output_file = "employerjob_jobinvite_combined.csv"
+output_file = "employerjob_jobinvite_transcripts_combined.csv"
 chunksize = 50000   # adjust as needed
 
 with engine.connect() as conn:

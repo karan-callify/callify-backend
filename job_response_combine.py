@@ -3,7 +3,8 @@ from sqlalchemy import create_engine
 
 # MySQL connection
 engine = create_engine("mysql+pymysql://root:2004@localhost:3306/callify")
-# SQL query
+
+# SQL query with new joins
 query = """
 SELECT
     -- Employer Job
@@ -96,7 +97,13 @@ SELECT
     cd.pin_code,
     cd.NPSCORE,
     cd.NMOBILEUPDATES,
-    cd.DTUPDATEDMOBILE
+    cd.DTUPDATEDMOBILE,
+
+    -- Recruiter transcripts merged
+    COALESCE(rt.transcripts, '') AS recruiter_transcripts,
+
+    -- Response transcripts merged (with NQNO ordering)
+    COALESCE(rst.transcripts, '') AS response_transcripts
 
 FROM employerjob ej
 LEFT JOIN jobresponse jr
@@ -111,16 +118,32 @@ LEFT JOIN location ci
     ON ej.city = ci.location_id
 LEFT JOIN location_zip_codes zc
     ON ej.pin_code = zc.zip_id
+LEFT JOIN (
+    SELECT 
+        NEMPID, 
+        NJDID, 
+        GROUP_CONCAT(STRTRANS ORDER BY NID SEPARATOR '** ') AS transcripts
+    FROM recruiter_transcripts
+    GROUP BY NEMPID, NJDID
+) rt
+    ON ej.empnumber = rt.NEMPID
+   AND ej.jobnumber = rt.NJDID
+LEFT JOIN (
+    SELECT 
+        NRESPID, 
+        GROUP_CONCAT(CONCAT(NQNO, ': ', STRTRANS) ORDER BY NQNO SEPARATOR ' ***** ') AS transcripts
+    FROM response_trans
+    GROUP BY NRESPID
+) rst
+    ON jr.NID = rst.NRESPID
 
 ORDER BY ej.empnumber, ej.jobnumber, jr.NID, cd.NID;
 """
 
-# Run query and fetch into DataFrame
-df = pd.read_sql(query, engine)
+# Export to CSV
+output_file = "employerjob_jobresponse_candidates_transcripts.csv"
 chunksize = 50000  
 
-# Save to CSV with safe quoting
-output_file = "employerjob_jobresponse_candidates.csv"
 with engine.connect() as conn:
     first = True
     i = 0
